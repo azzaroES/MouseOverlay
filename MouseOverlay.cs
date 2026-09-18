@@ -257,6 +257,7 @@ namespace MouseOverlay
         [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr hWnd, uint cmd);
         [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr hWnd, uint flags);
         [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
         [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder name, int max);
         [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vk);
@@ -662,7 +663,8 @@ namespace MouseOverlay
         readonly Label header = new Label(), body = new Label();
         float fontScale = -1;
         Font headerFont, bodyFont;
-        public event Action Clicked;
+        public event Action<Point> HeaderClicked;   // screen point; opens the language list
+        public event Action BodyClicked;            // copy + close
 
         public TranslatePopup()
         {
@@ -674,14 +676,15 @@ namespace MouseOverlay
             BackColor = Color.FromArgb(32, 33, 36);
             ForeColor = Color.White;
             header.AutoSize = true;
-            header.ForeColor = Color.FromArgb(165, 165, 172);
+            header.ForeColor = Color.FromArgb(190, 190, 200);
+            header.Cursor = Cursors.Hand;
             body.AutoSize = true;
             body.ForeColor = Color.White;
             Controls.Add(header);
             Controls.Add(body);
-            MouseClick += OnAnyClick;
-            header.MouseClick += OnAnyClick;
-            body.MouseClick += OnAnyClick;
+            MouseClick += OnBodyClick;
+            body.MouseClick += OnBodyClick;
+            header.MouseClick += delegate { if (HeaderClicked != null) HeaderClicked(Control.MousePosition); };
         }
 
         protected override bool ShowWithoutActivation { get { return true; } }
@@ -696,7 +699,7 @@ namespace MouseOverlay
             }
         }
 
-        void OnAnyClick(object s, MouseEventArgs e) { if (Clicked != null) Clicked(); }
+        void OnBodyClick(object s, MouseEventArgs e) { if (BodyClicked != null) BodyClicked(); }
 
         protected override void OnPaint(PaintEventArgs e)
         {
@@ -747,6 +750,34 @@ namespace MouseOverlay
                 if (bodyFont != null) bodyFont.Dispose();
             }
             base.Dispose(disposing);
+        }
+    }
+
+    // "Type a language code" dialog; always on top so it cannot open behind a game.
+    sealed class PromptForm : Form
+    {
+        readonly TextBox box = new TextBox();
+        public string Value { get { return box.Text.Trim(); } }
+
+        public PromptForm(string title, string caption, string initial, Point near)
+        {
+            float s = App.DpiAt(near) / 96f;
+            Text = title;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MinimizeBox = false; MaximizeBox = false; ShowInTaskbar = false; TopMost = true;
+            StartPosition = FormStartPosition.Manual;
+            AutoScaleMode = AutoScaleMode.None;
+            Font = new Font("Segoe UI", 12f * s, GraphicsUnit.Pixel);
+            ClientSize = new Size((int)(300 * s), (int)(74 * s));
+            Label l = new Label(); l.Text = caption; l.AutoSize = true; l.Location = new Point((int)(10 * s), (int)(10 * s));
+            box.Location = new Point((int)(10 * s), (int)(38 * s)); box.Width = (int)(190 * s); box.Text = initial;
+            Button ok = new Button(); ok.Text = "OK"; ok.DialogResult = DialogResult.OK;
+            ok.Location = new Point((int)(210 * s), (int)(36 * s)); ok.Size = new Size((int)(80 * s), (int)(26 * s));
+            Controls.Add(l); Controls.Add(box); Controls.Add(ok);
+            AcceptButton = ok;
+            Rectangle wa = Screen.FromPoint(near).WorkingArea;
+            Location = new Point(Math.Max(wa.Left, Math.Min(near.X, wa.Right - Width)), Math.Max(wa.Top, Math.Min(near.Y, wa.Bottom - Height)));
+            Shown += delegate { box.SelectAll(); box.Focus(); };
         }
     }
 
@@ -928,7 +959,8 @@ namespace MouseOverlay
         int captureStage, captureStart, translateId;
         bool hotkeyOn;
         Point translateAt;
-        string lastTranslation;
+        string lastTranslation, lastSource;
+        ContextMenu langMenu;
         readonly HashSet<IntPtr> unbeatableRoots = new HashSet<IntPtr>();
         int unbeatableClearedTick;
 
@@ -1112,7 +1144,7 @@ namespace MouseOverlay
             Native.POINT p;
             if (!Native.GetCursorPos(out p)) return;
 
-            // Click outside the popup closes it (after a grace period, so dismissing the app's own
+                // Click outside the popup closes it (after a grace period, so dismissing the app's own
             // context menu right after a Ctrl+right-click does not also take the translation away).
             if (popupShown && trackTicks - popupShownTick > 190 && (p.x < popupL || p.x >= popupR || p.y < popupT || p.y >= popupB))
                 Native.PostMessage(cursorWin.Handle, CursorWindow.WM_APP_POPUP_CLOSE, IntPtr.Zero, IntPtr.Zero);
@@ -1182,6 +1214,7 @@ namespace MouseOverlay
 
         void StartTranslate(string text)
         {
+            lastSource = text;
             int id = translateId;
             string target = cfg.TranslateTo, alt = cfg.TranslateAlt;
             bool truncated = text.Length > 3000;
@@ -1199,7 +1232,7 @@ namespace MouseOverlay
                         result = Translator.Translate(source, alt, out detected);
                         target = alt;
                     }
-                    head = (detected ?? "auto") + " → " + target + "   ·   click to copy";
+                    head = (detected ?? "auto") + " → " + target + " ▾   ·   click text to copy";
                     if (truncated) result += " …";
                     ok = true;
                 }
@@ -1222,11 +1255,12 @@ namespace MouseOverlay
             if (popup == null)
             {
                 popup = new TranslatePopup();
-                popup.Clicked += delegate
+                popup.BodyClicked += delegate
                 {
                     if (lastTranslation != null) try { Clipboard.SetText(lastTranslation); } catch { }
                     ClosePopup();
                 };
+                popup.HeaderClicked += ShowLanguageMenu;
             }
             popup.Present(translateAt, head, text);
             Rectangle b = popup.Bounds;
@@ -1239,6 +1273,53 @@ namespace MouseOverlay
         {
             popupShown = false;
             if (popup != null && popup.Visible) popup.Hide();
+        }
+
+        // Language list opened from the popup's header line; picking one re-translates the same text.
+        void ShowLanguageMenu(Point at)
+        {
+            if (langMenu == null)
+            {
+                langMenu = new ContextMenu();
+                foreach (string[] l in Translator.Languages)
+                {
+                    string code = l[0];
+                    MenuItem mi = new MenuItem(l[1] + "  (" + code + ")");
+                    mi.RadioCheck = true;
+                    mi.Tag = (Func<bool>)delegate { return cfg.TranslateTo == code; };
+                    mi.Click += delegate { SetTarget(code); };
+                    langMenu.MenuItems.Add(mi);
+                }
+                MenuItem other = new MenuItem("Other language code...");
+                other.Click += delegate { string v = PromptLanguage(translateAt); if (v != null) SetTarget(v); };
+                langMenu.MenuItems.Add(other);
+            }
+            SyncMenuChecks(langMenu.MenuItems);
+            popupShownTick = trackTicks;                       // the click on the menu must not close the popup
+            Native.SetForegroundWindow(popup.Handle);          // menus need their owner in the foreground
+            langMenu.Show(popup, popup.PointToClient(at));
+        }
+
+        void SetTarget(string code)
+        {
+            cfg.TranslateTo = code;
+            cfg.Save();
+            SyncMenuChecks(tray.ContextMenu.MenuItems);
+            if (lastSource == null) return;
+            translateId++;
+            lastTranslation = null;
+            ShowPopup("Google Translate", "Translating…");
+            StartTranslate(lastSource);
+        }
+
+        static string PromptLanguage(Point near)
+        {
+            using (PromptForm f = new PromptForm("Translate to", "Google Translate language code (sv, el, zh-TW, ...):", "", near))
+            {
+                if (f.ShowDialog() != DialogResult.OK) return null;
+                string v = f.Value;
+                return v.Length >= 2 && v.Length <= 7 ? v : null;
+            }
         }
 
         // Physically held modifiers are released first so the app sees a plain Ctrl+Insert / Ctrl+C.
@@ -1688,8 +1769,8 @@ namespace MouseOverlay
             MenuItem other = new MenuItem("Other language code...");
             other.Click += delegate
             {
-                string v = Microsoft.VisualBasic.Interaction.InputBox("Google Translate language code (e.g. sv, el, zh-TW):", "Translate to", cfg.TranslateTo).Trim();
-                if (v.Length >= 2 && v.Length <= 7) { cfg.TranslateTo = v; Changed(); }
+                string v = PromptLanguage(Control.MousePosition);
+                if (v != null) { cfg.TranslateTo = v; Changed(); }
             };
             to.MenuItems.Add(other);
             tr.MenuItems.Add(to);

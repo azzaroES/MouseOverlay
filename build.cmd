@@ -4,6 +4,6 @@ cd /d "%~dp0"
 "%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /target:winexe /platform:x64 /optimize+ ^
   /win32manifest:app.manifest /out:MouseOverlay.exe ^
   /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll ^
-  /r:System.Web.Extensions.dll /r:Microsoft.VisualBasic.dll MouseOverlay.cs
+  /r:System.Web.Extensions.dll MouseOverlay.cs
 if errorlevel 1 (echo BUILD FAILED & exit /b 1)
 echo Built MouseOverlay.exe
