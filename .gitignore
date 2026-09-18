@@ -1,0 +1,9 @@
+# user settings
+*.ini
+
+# build output (published on the Releases page instead)
+*.exe
+*.pdb
+
+# session notes
+INCIDENT.md
