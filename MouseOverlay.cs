@@ -7,8 +7,11 @@ using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Globalization;
 using System.IO;
+using System.Net;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
+using System.Web.Script.Serialization;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
@@ -16,8 +19,8 @@ using Microsoft.Win32;
 [assembly: System.Reflection.AssemblyTitle("Mouse Overlay")]
 [assembly: System.Reflection.AssemblyDescription("Cursor overlay with CPU/GPU temperature readout")]
 [assembly: System.Reflection.AssemblyProduct("Mouse Overlay")]
-[assembly: System.Reflection.AssemblyVersion("1.2.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.2.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.3.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.3.0.0")]
 
 namespace MouseOverlay
 {
@@ -50,6 +53,9 @@ namespace MouseOverlay
     // shell flyouts, exclusive-fullscreen games) the real cursor is left visible instead.
     enum RealCursorMode { Replace, ArrowOnly, Hide, AsIs }
 
+    // Mouse gesture that translates the current text selection.
+    enum TranslateTrigger { CtrlRightClick, MiddleClick, CtrlMiddleClick, Hotkey }
+
     // ------------------------------------------------------------------ settings
 
     sealed class Settings
@@ -66,6 +72,24 @@ namespace MouseOverlay
         public bool AutoHide = false;
         public bool ShowTemps = true;
         public int TempFontSize = 9;
+        public bool Translate = true;
+        public TranslateTrigger TranslateTrigger = TranslateTrigger.CtrlRightClick;
+        public string TranslateTo = DefaultTarget();
+        public string TranslateAlt = DefaultTarget() == "en" ? "" : "en";
+
+        static string DefaultTarget()
+        {
+            string ui = CultureInfo.CurrentUICulture.TwoLetterISOLanguageName;
+            return Translator.LanguageName(ui) != null ? ui : "en";
+        }
+
+        static string LangCode(string v)
+        {
+            v = v.Trim();
+            if (v.Length < 2 || v.Length > 7) return null;
+            foreach (char c in v) if (!char.IsLetter(c) && c != '-') return null;
+            return v;
+        }
 
         static string path;
 
@@ -121,6 +145,13 @@ namespace MouseOverlay
                         case "AutoHide": s.AutoHide = v == "1"; break;
                         case "ShowTemps": s.ShowTemps = v == "1"; break;
                         case "TempFontSize": s.TempFontSize = Clamp(ParseInt(v, s.TempFontSize), 6, 32); break;
+                        case "Translate": s.Translate = v == "1"; break;
+                        case "TranslateTrigger":
+                            foreach (TranslateTrigger t in Enum.GetValues(typeof(TranslateTrigger)))
+                                if (string.Equals(t.ToString(), v, StringComparison.OrdinalIgnoreCase)) s.TranslateTrigger = t;
+                            break;
+                        case "TranslateTo": s.TranslateTo = LangCode(v) ?? s.TranslateTo; break;
+                        case "TranslateAlt": s.TranslateAlt = v.Trim().Length == 0 ? "" : (LangCode(v) ?? s.TranslateAlt); break;
                     }
                 }
             }
@@ -144,7 +175,11 @@ namespace MouseOverlay
                     "RealCursor=" + RealCursor,
                     "AutoHide=" + (AutoHide ? "1" : "0"),
                     "ShowTemps=" + (ShowTemps ? "1" : "0"),
-                    "TempFontSize=" + TempFontSize
+                    "TempFontSize=" + TempFontSize,
+                    "Translate=" + (Translate ? "1" : "0"),
+                    "TranslateTrigger=" + TranslateTrigger,
+                    "TranslateTo=" + TranslateTo,
+                    "TranslateAlt=" + TranslateAlt
                 });
             }
             catch { }
@@ -172,7 +207,31 @@ namespace MouseOverlay
         public const int WS_EX_TOPMOST = 0x8, WS_EX_TRANSPARENT = 0x20, WS_EX_TOOLWINDOW = 0x80,
                          WS_EX_LAYERED = 0x80000, WS_EX_NOACTIVATE = 0x08000000;
         public const int WM_ENDSESSION = 0x16, WM_SETTINGCHANGE = 0x1A, WM_DISPLAYCHANGE = 0x7E,
-                         WM_DPICHANGED = 0x02E0, WM_THEMECHANGED = 0x031A, WM_APP = 0x8000;
+                         WM_DPICHANGED = 0x02E0, WM_HOTKEY = 0x0312, WM_THEMECHANGED = 0x031A, WM_APP = 0x8000;
+        public const int VK_LBUTTON = 0x01, VK_RBUTTON = 0x02, VK_MBUTTON = 0x04, VK_SHIFT = 0x10, VK_CONTROL = 0x11,
+                         VK_MENU = 0x12, VK_SPACE = 0x20, VK_INSERT = 0x2D, VK_C = 0x43;
+        public const uint MOD_CONTROL = 0x2, MOD_SHIFT = 0x4, MOD_NOREPEAT = 0x4000;
+        public const uint INPUT_KEYBOARD = 1, KEYEVENTF_EXTENDEDKEY = 0x1, KEYEVENTF_KEYUP = 0x2;
+
+        [StructLayout(LayoutKind.Sequential)] public struct KEYBDINPUT { public ushort wVk, wScan; public uint dwFlags, time; public IntPtr dwExtraInfo; }
+        [StructLayout(LayoutKind.Sequential)] public struct MOUSEINPUT { public int dx, dy; public uint mouseData, dwFlags, time; public IntPtr dwExtraInfo; }
+        [StructLayout(LayoutKind.Explicit)] public struct INPUTUNION { [FieldOffset(0)] public MOUSEINPUT mi; [FieldOffset(0)] public KEYBDINPUT ki; }
+        [StructLayout(LayoutKind.Sequential)] public struct INPUT { public uint type; public INPUTUNION u; }
+
+        public static INPUT Key(int vk, bool up)
+        {
+            INPUT i = new INPUT();
+            i.type = INPUT_KEYBOARD;
+            i.u.ki.wVk = (ushort)vk;
+            i.u.ki.dwFlags = (up ? KEYEVENTF_KEYUP : 0) | (vk == VK_INSERT ? KEYEVENTF_EXTENDEDKEY : 0);
+            return i;
+        }
+
+        [DllImport("user32.dll")] public static extern uint SendInput(uint count, INPUT[] inputs, int size);
+        [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint mods, uint vk);
+        [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+        [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
+        [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
         public const int SW_HIDE = 0, SW_SHOWNOACTIVATE = 4;
         public const uint SWP_NOSIZE = 0x1, SWP_NOMOVE = 0x2, SWP_NOACTIVATE = 0x10, SWP_NOSENDCHANGING = 0x400;
         public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
@@ -445,7 +504,8 @@ namespace MouseOverlay
 
     sealed class CursorWindow : LayeredWindow
     {
-        public const int WM_APP_STATE = Native.WM_APP + 1, WM_APP_RAISE = Native.WM_APP + 2;
+        public const int WM_APP_STATE = Native.WM_APP + 1, WM_APP_RAISE = Native.WM_APP + 2,
+                         WM_APP_TRANSLATE = Native.WM_APP + 3, WM_APP_POPUP_CLOSE = Native.WM_APP + 4;
         readonly App app;
 
         public CursorWindow(App app) { this.app = app; }
@@ -457,6 +517,9 @@ namespace MouseOverlay
             {
                 case WM_APP_STATE: app.ApplyState((int)m.WParam.ToInt64()); break;
                 case WM_APP_RAISE: app.RaiseRequested(); break;
+                case WM_APP_TRANSLATE: app.TranslateAt(new Point((int)m.WParam.ToInt64(), (int)m.LParam.ToInt64())); break;
+                case WM_APP_POPUP_CLOSE: app.ClosePopup(); break;
+                case Native.WM_HOTKEY: app.TranslateAtCursor(); break;
                 case Native.WM_DISPLAYCHANGE:
                 case Native.WM_DPICHANGED:
                 case Native.WM_THEMECHANGED:
@@ -514,6 +577,176 @@ namespace MouseOverlay
                 try { tick(); } catch { }
             }
             if (timer != IntPtr.Zero) CloseHandle(timer);
+        }
+    }
+
+    // ------------------------------------------------------------------ translation
+
+    // Google Translate's public web endpoint (the one the website itself uses); no key needed.
+    static class Translator
+    {
+        public static readonly string[][] Languages = {
+            new[] { "en", "English" }, new[] { "ro", "Română" }, new[] { "es", "Español" }, new[] { "de", "Deutsch" },
+            new[] { "fr", "Français" }, new[] { "it", "Italiano" }, new[] { "pt", "Português" }, new[] { "nl", "Nederlands" },
+            new[] { "pl", "Polski" }, new[] { "tr", "Türkçe" }, new[] { "ru", "Русский" }, new[] { "uk", "Українська" },
+            new[] { "ar", "العربية" }, new[] { "hi", "हिन्दी" }, new[] { "zh-CN", "中文 (简体)" }, new[] { "ja", "日本語" },
+            new[] { "ko", "한국어" } };
+
+        static bool tlsSet;
+
+        public static string LanguageName(string code)
+        {
+            foreach (string[] l in Languages)
+                if (string.Equals(l[0], code, StringComparison.OrdinalIgnoreCase)) return l[1];
+            return null;
+        }
+
+        // Blocking; call from a worker thread. Throws on network / server failure.
+        public static string Translate(string text, string target, out string detected)
+        {
+            if (!tlsSet)
+            {
+                ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
+                ServicePointManager.Expect100Continue = false;
+                tlsSet = true;
+            }
+            string url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&dt=t&ie=UTF-8&oe=UTF-8&tl=" + Uri.EscapeDataString(target);
+            string q = "q=" + Uri.EscapeDataString(text);
+            string json;
+            try { json = Request(url, q); }
+            catch (WebException ex)
+            {
+                HttpWebResponse r = ex.Response as HttpWebResponse;
+                if (r == null || (int)r.StatusCode == 429 || url.Length + q.Length > 6000) throw;
+                json = Request(url + "&" + q, null);              // some fronts reject POST; retry as GET
+            }
+            JavaScriptSerializer ser = new JavaScriptSerializer();
+            ser.MaxJsonLength = int.MaxValue;
+            object[] root = ser.DeserializeObject(json) as object[];
+            if (root == null || root.Length == 0) throw new Exception("Unexpected reply from Google Translate.");
+            StringBuilder sb = new StringBuilder();
+            object[] segments = root[0] as object[];
+            if (segments != null)
+                foreach (object seg in segments)
+                {
+                    object[] s = seg as object[];
+                    if (s != null && s.Length > 0 && s[0] is string) sb.Append((string)s[0]);
+                }
+            detected = root.Length > 2 ? root[2] as string : null;
+            return sb.ToString();
+        }
+
+        static string Request(string url, string postBody)
+        {
+            HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
+            req.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+            req.Timeout = 10000;
+            req.ReadWriteTimeout = 10000;
+            if (postBody != null)
+            {
+                byte[] body = Encoding.UTF8.GetBytes(postBody);
+                req.Method = "POST";
+                req.ContentType = "application/x-www-form-urlencoded;charset=utf-8";
+                req.ContentLength = body.Length;
+                using (Stream s = req.GetRequestStream()) s.Write(body, 0, body.Length);
+            }
+            using (WebResponse resp = req.GetResponse())
+            using (StreamReader r = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+                return r.ReadToEnd();
+        }
+    }
+
+    // Small dark tool window at the pointer. Never takes focus, so the selection in the app survives.
+    sealed class TranslatePopup : Form
+    {
+        readonly Label header = new Label(), body = new Label();
+        float fontScale = -1;
+        Font headerFont, bodyFont;
+        public event Action Clicked;
+
+        public TranslatePopup()
+        {
+            FormBorderStyle = FormBorderStyle.None;
+            ShowInTaskbar = false;
+            StartPosition = FormStartPosition.Manual;
+            TopMost = true;
+            AutoScaleMode = AutoScaleMode.None;
+            BackColor = Color.FromArgb(32, 33, 36);
+            ForeColor = Color.White;
+            header.AutoSize = true;
+            header.ForeColor = Color.FromArgb(165, 165, 172);
+            body.AutoSize = true;
+            body.ForeColor = Color.White;
+            Controls.Add(header);
+            Controls.Add(body);
+            MouseClick += OnAnyClick;
+            header.MouseClick += OnAnyClick;
+            body.MouseClick += OnAnyClick;
+        }
+
+        protected override bool ShowWithoutActivation { get { return true; } }
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                CreateParams cp = base.CreateParams;
+                cp.ExStyle |= Native.WS_EX_NOACTIVATE | Native.WS_EX_TOOLWINDOW | Native.WS_EX_TOPMOST;
+                return cp;
+            }
+        }
+
+        void OnAnyClick(object s, MouseEventArgs e) { if (Clicked != null) Clicked(); }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            using (Pen p = new Pen(Color.FromArgb(80, 80, 88)))
+                e.Graphics.DrawRectangle(p, 0, 0, Width - 1, Height - 1);
+        }
+
+        public void Present(Point anchor, string head, string text)
+        {
+            float scale = App.DpiAt(anchor) / 96f;
+            if (scale != fontScale)
+            {
+                if (headerFont != null) headerFont.Dispose();
+                if (bodyFont != null) bodyFont.Dispose();
+                headerFont = new Font("Segoe UI", 12f * scale, GraphicsUnit.Pixel);
+                bodyFont = new Font("Segoe UI", 15f * scale, GraphicsUnit.Pixel);
+                header.Font = headerFont;
+                body.Font = bodyFont;
+                fontScale = scale;
+            }
+            int pad = (int)(12 * scale);
+            body.MaximumSize = new Size((int)(460 * scale), 0);
+            header.Text = head;
+            body.Text = text;
+            header.Location = new Point(pad, pad);
+            body.Location = new Point(pad, header.Bottom + (int)(6 * scale));
+            int w = Math.Max(header.Width, body.Width) + pad * 2;
+            int h = body.Bottom + pad;
+
+            Rectangle wa = Screen.FromPoint(anchor).WorkingArea;
+            int x = anchor.X + (int)(8 * scale), y = anchor.Y - h - (int)(12 * scale); // above the pointer: context menus open below
+            if (y < wa.Top) y = anchor.Y + (int)(20 * scale);
+            if (x + w > wa.Right) x = wa.Right - w;
+            if (x < wa.Left) x = wa.Left;
+            if (y + h > wa.Bottom) y = wa.Bottom - h;
+            Bounds = new Rectangle(x, y, w, h);
+            Invalidate();
+            if (!Visible) Show();
+            else Native.SetWindowPos(Handle, Native.HWND_TOPMOST, 0, 0, 0, 0, Native.SWP_NOSIZE | Native.SWP_NOMOVE | Native.SWP_NOACTIVATE);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                if (headerFont != null) headerFont.Dispose();
+                if (bodyFont != null) bodyFont.Dispose();
+            }
+            base.Dispose(disposing);
         }
     }
 
@@ -679,6 +912,23 @@ namespace MouseOverlay
         IntPtr lastFg;
         bool lastFgShell;
         int mediaKeyTick = -100000, shellPidsClearedTick;
+
+        // Translate: gesture detection (tracker thread) and popup geometry (shared)
+        const int HOTKEY_ID = 1;
+        bool lWas, rWas, mWas;
+        int lastTriggerTick = -1000;
+        volatile bool popupShown;
+        volatile int popupL, popupT, popupR, popupB, popupShownTick;
+
+        // Translate: capture + request state (UI thread)
+        TranslatePopup popup;
+        readonly System.Windows.Forms.Timer captureTimer;
+        DataObject savedClip;
+        uint clipSeq0;
+        int captureStage, captureStart, translateId;
+        bool hotkeyOn;
+        Point translateAt;
+        string lastTranslation;
         readonly HashSet<IntPtr> unbeatableRoots = new HashSet<IntPtr>();
         int unbeatableClearedTick;
 
@@ -712,6 +962,10 @@ namespace MouseOverlay
             reapplyTimer.Interval = 600;
             reapplyTimer.Tick += delegate { reapplyTimer.Stop(); EnsureReplacement(); OnDisplayChange(); };
 
+            captureTimer = new System.Windows.Forms.Timer();
+            captureTimer.Interval = 15;
+            captureTimer.Tick += delegate { CaptureTick(); };
+
             // Clean up if a previous instance died mid-way.
             SystemCursors.Restore();
             if (Native.MagInitialize()) { magInit = true; Native.MagShowSystemCursor(true); }
@@ -737,6 +991,8 @@ namespace MouseOverlay
         void Sync()
         {
             trackTicks++;
+            PollButtons();
+            if (!cfg.Enabled) return;
             Native.CURSORINFO ci = new Native.CURSORINFO();
             ci.cbSize = Marshal.SizeOf(typeof(Native.CURSORINFO));
             if (!Native.GetCursorInfo(ref ci)) return; // e.g. secure desktop up; keep current state
@@ -841,6 +1097,220 @@ namespace MouseOverlay
             return covered;
         }
 
+        // ---- translate
+
+        static bool KeyDown(int vk) { return (Native.GetAsyncKeyState(vk) & 0x8000) != 0; }
+
+        // Tracker thread: mouse-button edges for the translate gesture and for dismissing the popup.
+        void PollButtons()
+        {
+            bool l = KeyDown(Native.VK_LBUTTON), r = KeyDown(Native.VK_RBUTTON), m = KeyDown(Native.VK_MBUTTON);
+            bool lEdge = l && !lWas, rEdge = r && !rWas, mEdge = m && !mWas;
+            lWas = l; rWas = r; mWas = m;
+            if (!lEdge && !rEdge && !mEdge) return;
+            bool ctrl = KeyDown(Native.VK_CONTROL);
+            Native.POINT p;
+            if (!Native.GetCursorPos(out p)) return;
+
+            // Click outside the popup closes it (after a grace period, so dismissing the app's own
+            // context menu right after a Ctrl+right-click does not also take the translation away).
+            if (popupShown && trackTicks - popupShownTick > 190 && (p.x < popupL || p.x >= popupR || p.y < popupT || p.y >= popupB))
+                Native.PostMessage(cursorWin.Handle, CursorWindow.WM_APP_POPUP_CLOSE, IntPtr.Zero, IntPtr.Zero);
+
+            if (!cfg.Translate || trackTicks - lastTriggerTick < 40) return;
+            bool fire = false;
+            switch (cfg.TranslateTrigger)
+            {
+                case TranslateTrigger.CtrlRightClick: fire = rEdge && ctrl; break;
+                case TranslateTrigger.MiddleClick: fire = mEdge && !ctrl; break;
+                case TranslateTrigger.CtrlMiddleClick: fire = mEdge && ctrl; break;
+            }
+            if (!fire) return;
+            lastTriggerTick = trackTicks;
+            Native.PostMessage(cursorWin.Handle, CursorWindow.WM_APP_TRANSLATE, new IntPtr(p.x), new IntPtr(p.y));
+        }
+
+        public void TranslateAtCursor()
+        {
+            Native.POINT p;
+            if (Native.GetCursorPos(out p)) TranslateAt(new Point(p.x, p.y));
+        }
+
+        // UI thread. Copies the selection through the clipboard (Ctrl+Insert, which is never SIGINT
+        // in a terminal), restores the clipboard afterwards, then asks Google Translate.
+        public void TranslateAt(Point p)
+        {
+            if (!cfg.Translate) return;
+            translateAt = p;
+            translateId++;
+            lastTranslation = null;
+            ShowPopup("Google Translate", "Translating…");
+            captureTimer.Stop();
+            savedClip = SnapshotClipboard();
+            clipSeq0 = Native.GetClipboardSequenceNumber();
+            SendCopy(false);
+            captureStage = 1;
+            captureStart = Environment.TickCount;
+            captureTimer.Start();
+        }
+
+        void CaptureTick()
+        {
+            if (Native.GetClipboardSequenceNumber() != clipSeq0)
+            {
+                captureTimer.Stop();
+                string text = null;
+                try { if (Clipboard.ContainsText()) text = Clipboard.GetText(); } catch { }
+                RestoreClipboard();
+                if (text == null || text.Trim().Length == 0) ShowPopup("Nothing to translate", "The selection contained no text.");
+                else StartTranslate(text.Trim());
+                return;
+            }
+            int elapsed = Environment.TickCount - captureStart;
+            if (elapsed <= 300) return;
+            if (captureStage == 1 && !ForegroundIsTerminal())
+            {
+                SendCopy(true);                                   // app ignored Ctrl+Insert; try Ctrl+C
+                captureStage = 2;
+                captureStart = Environment.TickCount;
+                return;
+            }
+            captureTimer.Stop();
+            savedClip = null;
+            ShowPopup("Nothing selected", "Select some text first.\n(Copy did not work here: games and elevated apps block it.)");
+        }
+
+        void StartTranslate(string text)
+        {
+            int id = translateId;
+            string target = cfg.TranslateTo, alt = cfg.TranslateAlt;
+            bool truncated = text.Length > 3000;
+            string source = truncated ? text.Substring(0, 3000) : text;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                string head, result;
+                bool ok = false;
+                try
+                {
+                    string detected;
+                    result = Translator.Translate(source, target, out detected);
+                    if (alt.Length > 0 && detected != null && string.Equals(detected, target, StringComparison.OrdinalIgnoreCase))
+                    {
+                        result = Translator.Translate(source, alt, out detected);
+                        target = alt;
+                    }
+                    head = (detected ?? "auto") + " → " + target + "   ·   click to copy";
+                    if (truncated) result += " …";
+                    ok = true;
+                }
+                catch (Exception ex) { head = "Translate failed"; result = ex.Message; }
+                try
+                {
+                    popup.BeginInvoke((Action)delegate
+                    {
+                        if (id != translateId) return;
+                        ShowPopup(head, result);
+                        lastTranslation = ok ? result : null;
+                    });
+                }
+                catch { }
+            });
+        }
+
+        void ShowPopup(string head, string text)
+        {
+            if (popup == null)
+            {
+                popup = new TranslatePopup();
+                popup.Clicked += delegate
+                {
+                    if (lastTranslation != null) try { Clipboard.SetText(lastTranslation); } catch { }
+                    ClosePopup();
+                };
+            }
+            popup.Present(translateAt, head, text);
+            Rectangle b = popup.Bounds;
+            popupL = b.Left; popupT = b.Top; popupR = b.Right; popupB = b.Bottom;
+            popupShownTick = trackTicks;
+            popupShown = true;
+        }
+
+        public void ClosePopup()
+        {
+            popupShown = false;
+            if (popup != null && popup.Visible) popup.Hide();
+        }
+
+        // Physically held modifiers are released first so the app sees a plain Ctrl+Insert / Ctrl+C.
+        static void SendCopy(bool ctrlC)
+        {
+            List<Native.INPUT> seq = new List<Native.INPUT>();
+            if (KeyDown(Native.VK_SHIFT)) seq.Add(Native.Key(Native.VK_SHIFT, true));
+            if (KeyDown(Native.VK_MENU)) seq.Add(Native.Key(Native.VK_MENU, true));
+            bool ctrlHeld = KeyDown(Native.VK_CONTROL);
+            if (!ctrlHeld) seq.Add(Native.Key(Native.VK_CONTROL, false));
+            int key = ctrlC ? Native.VK_C : Native.VK_INSERT;
+            seq.Add(Native.Key(key, false));
+            seq.Add(Native.Key(key, true));
+            if (!ctrlHeld) seq.Add(Native.Key(Native.VK_CONTROL, true));
+            Native.SendInput((uint)seq.Count, seq.ToArray(), Marshal.SizeOf(typeof(Native.INPUT)));
+        }
+
+        static bool ForegroundIsTerminal()
+        {
+            System.Text.StringBuilder cls = new System.Text.StringBuilder(64);
+            Native.GetClassName(Native.GetForegroundWindow(), cls, cls.Capacity);
+            switch (cls.ToString())
+            {
+                case "ConsoleWindowClass": case "CASCADIA_HOSTING_WINDOW_CLASS": case "mintty": case "PuTTY": case "VirtualConsoleClass":
+                    return true;
+            }
+            return false;
+        }
+
+        static readonly string[] KeptFormats = { DataFormats.UnicodeText, DataFormats.Text, DataFormats.Html, DataFormats.Rtf, DataFormats.FileDrop, DataFormats.Bitmap };
+
+        static DataObject SnapshotClipboard()
+        {
+            try
+            {
+                IDataObject cur = Clipboard.GetDataObject();
+                if (cur == null) return null;
+                DataObject copy = new DataObject();
+                foreach (string f in KeptFormats)
+                {
+                    if (!cur.GetDataPresent(f)) continue;
+                    object d = cur.GetData(f);
+                    if (d != null) copy.SetData(f, d);
+                }
+                return copy.GetFormats().Length > 0 ? copy : null;
+            }
+            catch { return null; }
+        }
+
+        void RestoreClipboard()
+        {
+            try
+            {
+                if (savedClip != null) Clipboard.SetDataObject(savedClip, true, 5, 40);
+                else Clipboard.Clear();
+            }
+            catch { }
+            savedClip = null;
+        }
+
+        public static float DpiAt(Point p)
+        {
+            try
+            {
+                uint dx, dy;
+                IntPtr mon = Native.MonitorFromPoint(new Native.POINT(p.X, p.Y), 2 /* MONITOR_DEFAULTTONEAREST */);
+                if (Native.GetDpiForMonitor(mon, Native.MDT_EFFECTIVE_DPI, out dx, out dy) == 0 && dy > 0) return dy;
+            }
+            catch { }
+            return 96f;
+        }
+
         // UI thread, from WM_APP_RAISE: try to get above whatever the tracker found covering us.
         public void RaiseRequested()
         {
@@ -905,16 +1375,18 @@ namespace MouseOverlay
             lastX = int.MinValue;
             lastState = -1;
             zTimer.Enabled = cfg.Enabled;
-            if (cfg.Enabled)
+            if (!cfg.Enabled)
             {
-                tracker.Start();
-            }
-            else
-            {
-                tracker.Stop();
                 cursorWin.Visible = false;
                 SetRealCursorHidden(false);
             }
+            if (cfg.Enabled || cfg.Translate) tracker.Start(); else tracker.Stop();
+
+            bool wantHotkey = cfg.Translate && cfg.TranslateTrigger == TranslateTrigger.Hotkey;
+            if (wantHotkey && !hotkeyOn)
+                hotkeyOn = Native.RegisterHotKey(cursorWin.Handle, HOTKEY_ID, Native.MOD_CONTROL | Native.MOD_SHIFT | Native.MOD_NOREPEAT, (uint)Native.VK_SPACE);
+            else if (!wantHotkey && hotkeyOn) { Native.UnregisterHotKey(cursorWin.Handle, HOTKEY_ID); hotkeyOn = false; }
+            if (!cfg.Translate) ClosePopup();
 
             if (cfg.ShowTemps)
             {
@@ -1152,6 +1624,11 @@ namespace MouseOverlay
             return Item(text, delegate { return cfg.RealCursor == mode; }, delegate { cfg.RealCursor = mode; }, true);
         }
 
+        MenuItem TriggerItem(string text, TranslateTrigger t)
+        {
+            return Item(text, delegate { return cfg.TranslateTrigger == t; }, delegate { cfg.TranslateTrigger = t; }, true);
+        }
+
         ContextMenu BuildMenu()
         {
             ContextMenu menu = new ContextMenu();
@@ -1192,6 +1669,39 @@ namespace MouseOverlay
             menu.MenuItems.Add(Item("Show CPU / GPU temperature", delegate { return cfg.ShowTemps; }, delegate { cfg.ShowTemps = !cfg.ShowTemps; }, false));
             menu.MenuItems.Add(IntChoice("Temperature text size", new int[] { 7, 8, 9, 10, 12, 14 }, " pt",
                 delegate { return cfg.TempFontSize; }, delegate(int v) { cfg.TempFontSize = v; }));
+
+            menu.MenuItems.Add("-");
+            MenuItem tr = new MenuItem("Translate selection");
+            tr.MenuItems.Add(Item("Enabled", delegate { return cfg.Translate; }, delegate { cfg.Translate = !cfg.Translate; }, false));
+            MenuItem trig = new MenuItem("Trigger");
+            trig.MenuItems.Add(TriggerItem("Ctrl + right-click", TranslateTrigger.CtrlRightClick));
+            trig.MenuItems.Add(TriggerItem("Middle click", TranslateTrigger.MiddleClick));
+            trig.MenuItems.Add(TriggerItem("Ctrl + middle click", TranslateTrigger.CtrlMiddleClick));
+            trig.MenuItems.Add(TriggerItem("Ctrl + Shift + Space", TranslateTrigger.Hotkey));
+            tr.MenuItems.Add(trig);
+            MenuItem to = new MenuItem("Translate to");
+            foreach (string[] l in Translator.Languages)
+            {
+                string code = l[0];
+                to.MenuItems.Add(Item(l[1] + "  (" + code + ")", delegate { return cfg.TranslateTo == code; }, delegate { cfg.TranslateTo = code; }, true));
+            }
+            MenuItem other = new MenuItem("Other language code...");
+            other.Click += delegate
+            {
+                string v = Microsoft.VisualBasic.Interaction.InputBox("Google Translate language code (e.g. sv, el, zh-TW):", "Translate to", cfg.TranslateTo).Trim();
+                if (v.Length >= 2 && v.Length <= 7) { cfg.TranslateTo = v; Changed(); }
+            };
+            to.MenuItems.Add(other);
+            tr.MenuItems.Add(to);
+            MenuItem alt = new MenuItem("If already in that language, translate to");
+            alt.MenuItems.Add(Item("Nothing", delegate { return cfg.TranslateAlt.Length == 0; }, delegate { cfg.TranslateAlt = ""; }, true));
+            foreach (string[] l in Translator.Languages)
+            {
+                string code = l[0];
+                alt.MenuItems.Add(Item(l[1] + "  (" + code + ")", delegate { return cfg.TranslateAlt == code; }, delegate { cfg.TranslateAlt = code; }, true));
+            }
+            tr.MenuItems.Add(alt);
+            menu.MenuItems.Add(tr);
 
             menu.MenuItems.Add("-");
             menu.MenuItems.Add(Item("Start with Windows", IsAutoStart, delegate { SetAutoStart(!IsAutoStart()); }, false));
@@ -1268,6 +1778,9 @@ namespace MouseOverlay
                 SetRealCursorHidden(false);
                 if (magInit) { Native.MagUninitialize(); magInit = false; }
                 if (cursorsReplaced) { SystemCursors.Restore(); cursorsReplaced = false; }
+                if (hotkeyOn) { Native.UnregisterHotKey(cursorWin.Handle, HOTKEY_ID); hotkeyOn = false; }
+                captureTimer.Dispose();
+                if (popup != null) popup.Dispose();
                 zTimer.Dispose();
                 tempTimer.Dispose();
                 reapplyTimer.Dispose();

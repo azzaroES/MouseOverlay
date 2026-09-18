@@ -6,6 +6,16 @@ Tiny tray-only cursor overlay for Windows (single ~30 KB exe, no runtime to inst
 - **CPU / GPU temperature** in small text at the bottom-right of the primary screen (yellow at 80°, red at 90°).
 - Everything is configured from the tray icon's right-click menu. Left-click the icon to toggle the overlay.
 
+## Translate any selected text (branch `translate`)
+
+Select text in any app, **Ctrl + right-click** it, and a small dark popup at the pointer shows the Google Translate result (source language auto-detected). Click the popup to copy the translation; click anywhere else to dismiss it.
+
+- **Trigger** (tray → Translate selection → Trigger): Ctrl + right-click, middle click, Ctrl + middle click, or the Ctrl + Shift + Space hotkey. With the right-click triggers the app's own context menu still opens; press Esc to close it, the translation stays.
+- **Translate to**: 17 languages in the menu, or type any Google language code. Optional second language for when the text is already in your target language (e.g. ro → en, en → ro).
+- **How it gets the text**: it sends Ctrl+Insert to the app (Ctrl+C as a fallback, never in a terminal), reads the clipboard, then puts your previous clipboard contents back. Elevated apps and most games block that, so nothing happens there.
+- Uses the same free endpoint the Google Translate website uses; no key, no account. It can rate-limit heavy use.
+- Costs nothing while idle: the gesture is read by the same 8 ms tracker thread as the pointer; no hooks.
+
 ## Download
 
 Grab `MouseOverlay.exe` from the [Releases](https://github.com/azzaroES/MouseOverlay/releases) page and run it. No installer, no runtime to install (uses the .NET Framework 4.8 that ships with Windows 10/11, x64).
